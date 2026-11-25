@@ -9,12 +9,12 @@ const ADMIN_PASS = process.env.ADMIN_PASS || '778899';
 const MC_HOST = process.env.MC_HOST || 'frokamc.uz';
 const MC_PORT = Number(process.env.MC_PORT || 25565);
 const MC_VERSION = process.env.MC_VERSION || '1.21.11';
-// Masalan: "uzcraft:123456,moddie:123456"
+// Masalan: "uzbekman:123,ozbekafk:123,eshshaksikar:123"
 const INITIAL_ACCOUNTS = process.env.INITIAL_ACCOUNTS || '';
 // ===================================================
 
 const DATA_FILE = path.join('/tmp', 'accounts.json');
-const bots = new Map(); // username -> bot state
+const bots = new Map();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const randomDelay = (min = 200, max = 500) =>
@@ -30,6 +30,12 @@ function saveAccountsToDisk() {
   } catch (err) {
     console.log('[SAVE ERROR]', err.message);
   }
+}
+
+function buildEnvString() {
+  return Array.from(bots.values())
+    .map((b) => `${b.username}:${b.password}`)
+    .join(',');
 }
 
 function loadInitialAccounts() {
@@ -52,7 +58,9 @@ function loadInitialAccounts() {
       if (Array.isArray(raw)) {
         for (const item of raw) {
           if (item && item.username && item.password) {
-            loaded.set(String(item.username).trim(), String(item.password).trim());
+            const u = String(item.username).trim();
+            const p = String(item.password).trim();
+            if (!loaded.has(u)) loaded.set(u, p);
           }
         }
       }
@@ -84,7 +92,18 @@ function scheduleReconnect(state, reason) {
   state.reconnectTimeout = setTimeout(() => {
     state.isReconnecting = false;
     if (!state.stopped) connectBot(state);
-  }, 15000);
+  }, 35000);
+}
+
+function parseReason(reason) {
+  if (!reason) return 'Uzildi';
+  if (typeof reason === 'string') return reason.slice(0, 70);
+  if (reason.text) return String(reason.text).slice(0, 70);
+  if (Array.isArray(reason.extra)) {
+    const txt = reason.extra.map((x) => (typeof x === 'string' ? x : x.text || '')).join('');
+    if (txt) return txt.slice(0, 70);
+  }
+  return JSON.stringify(reason).slice(0, 70);
 }
 
 function connectBot(state) {
@@ -102,22 +121,23 @@ function connectBot(state) {
     });
   } catch (err) {
     console.log(`[CREATE ERROR:${state.username}]`, err.message);
-    scheduleReconnect(state, 'Yaratish xatosi');
+    scheduleReconnect(state, err.message);
     return;
   }
 
   state.bot = bot;
-  let loginSent = false;
+  let authSent = false;
 
-  function runLoginAndServer() {
-    if (loginSent || state.stopped || !bot || !bot.entity) return;
-    loginSent = true;
-    state.status = 'Login yuborilmoqda...';
+  function runAuthAndServer(isRegister = false) {
+    if (authSent || state.stopped || !bot || !bot.entity) return;
+    authSent = true;
 
-    try {
+    if (isRegister) {
+      state.status = 'Register yuborilmoqda...';
+      bot.chat(`/register ${state.password} ${state.password}`);
+    } else {
+      state.status = 'Login yuborilmoqda...';
       bot.chat(`/login ${state.password}`);
-    } catch (err) {
-      console.log(`[LOGIN CMD ERROR:${state.username}]`, err.message);
     }
 
     setTimeout(() => {
@@ -137,10 +157,9 @@ function connectBot(state) {
     state.status = 'Lobbyda (kutilmoqda)';
 
     setTimeout(() => {
-      runLoginAndServer();
-    }, 5000);
+      runAuthAndServer(false);
+    }, 6000);
 
-    // Anti-AFK: har 45 soniyada qarashni o'zgartirish va 200-500ms sakrash
     state.antiAfkInterval = setInterval(() => {
       if (!bot.entity || state.stopped) return;
       try {
@@ -163,29 +182,34 @@ function connectBot(state) {
   bot.on('message', (jsonMsg) => {
     const text = jsonMsg.toString().trim();
     if (!text) return;
+    console.log(`[CHAT:${state.username}]`, text);
 
     const lower = text.toLowerCase();
-    if (!loginSent && (lower.includes('/login') || lower.includes('/ʟᴏɢɪɴ'))) {
-      setTimeout(() => {
-        runLoginAndServer();
-      }, 3000);
+    if (!authSent) {
+      if (lower.includes('/register') || lower.includes('/ʀᴇɢɪsᴛᴇʀ')) {
+        setTimeout(() => runAuthAndServer(true), 2000);
+      } else if (lower.includes('/login') || lower.includes('/ʟᴏɢɪɴ')) {
+        setTimeout(() => runAuthAndServer(false), 2000);
+      }
     }
   });
 
   bot.on('kicked', (reason) => {
-    console.log(`[KICKED:${state.username}]`, reason);
+    const msg = parseReason(reason);
+    console.log(`[KICKED:${state.username}]`, msg);
     state.bot = null;
-    scheduleReconnect(state, 'Kick');
+    scheduleReconnect(state, `Kick: ${msg}`);
   });
 
-  bot.on('end', () => {
+  bot.on('end', (reason) => {
+    console.log(`[END:${state.username}]`, reason || 'Uzildi');
     state.bot = null;
-    scheduleReconnect(state, 'Uzildi');
+    scheduleReconnect(state, reason || 'Uzildi');
   });
 
   bot.on('error', (err) => {
     console.log(`[ERROR:${state.username}]`, err.message);
-    scheduleReconnect(state, 'Xato');
+    scheduleReconnect(state, `Xato: ${err.message}`);
   });
 }
 
@@ -230,12 +254,24 @@ function removeAccount(username, save = true) {
   return true;
 }
 
-// Boshlang'ich akkauntlarni ketma-ket ulash
+async function reconnectAllSequential() {
+  for (const state of bots.values()) {
+    if (state.stopped) continue;
+    if (state.bot) {
+      try { state.bot.quit(); } catch (_) {}
+      state.bot = null;
+    }
+    state.isReconnecting = false;
+    connectBot(state);
+    await sleep(7000);
+  }
+}
+
 (async () => {
   const initial = loadInitialAccounts();
   for (const [u, p] of initial.entries()) {
     addAccount(u, p);
-    await sleep(4000);
+    await sleep(7000);
   }
 })();
 
@@ -267,7 +303,7 @@ const HTML_PAGE = `<!DOCTYPE html>
 <style>
   * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
   body { background: #0f172a; color: #f8fafc; margin: 0; padding: 20px; display: flex; justify-content: center; }
-  .container { width: 100%; max-width: 740px; }
+  .container { width: 100%; max-width: 760px; }
   .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; margin-bottom: 16px; }
   h1, h2 { margin-top: 0; font-size: 1.25rem; }
   input, select, button { padding: 10px 14px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #fff; font-size: 14px; }
@@ -284,13 +320,14 @@ const HTML_PAGE = `<!DOCTYPE html>
   .badge { padding: 4px 8px; border-radius: 6px; font-size: 12px; background: #334155; margin-left: 8px; }
   .online { background: #166534; color: #bbf7d0; }
   .hidden { display: none; }
+  .env-box { width: 100%; margin-top: 10px; font-family: monospace; font-size: 12px; color: #cbd5e1; }
   #toast { position: fixed; bottom: 20px; right: 20px; background: #0284c7; color: #fff; padding: 12px 18px; border-radius: 8px; display: none; z-index: 999; }
 </style>
 </head>
 <body>
 <div class="container">
   <div id="loginBox" class="card">
-    <h1>🔐 AFK Panelga kirish (Koyeb)</h1>
+    <h1>🔐 AFK Panelga kirish</h1>
     <div class="row">
       <input type="password" id="passInput" placeholder="Admin parolni kiriting..." onkeydown="if(event.key==='Enter') login()">
       <button onclick="login()">Kirish</button>
@@ -300,10 +337,10 @@ const HTML_PAGE = `<!DOCTYPE html>
   <div id="panelBox" class="hidden">
     <div class="card">
       <h2>➕ Yangi AFK Akkaunt Qo‘shish</h2>
-      <p style="color:#94a3b8;font-size:13px;margin-top:-8px;">frokamc.uz → /login → /server anarxiya2</p>
+      <p style="color:#94a3b8;font-size:13px;margin-top:-8px;">frokamc.uz → /register yoki /login → /server anarxiya2</p>
       <div class="row">
-        <input type="text" id="newUser" placeholder="Minecraft nik (masalan: uzcraft)">
-        <input type="text" id="newPass" placeholder="Login parol">
+        <input type="text" id="newUser" placeholder="Minecraft nik">
+        <input type="text" id="newPass" placeholder="Parol">
         <button onclick="addAcc()">Qo‘shish</button>
       </div>
     </div>
@@ -320,11 +357,22 @@ const HTML_PAGE = `<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-        <h2 style="margin:0;">🤖 Faol Akkauntlar (<span id="botCount">0</span>)</h2>
-        <button class="secondary" onclick="loadBots()">Yangilash</button>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:8px;flex-wrap:wrap;">
+        <h2 style="margin:0;">🤖 Barcha Akkauntlar (<span id="botCount">0</span>)</h2>
+        <div class="row">
+          <button class="secondary" onclick="reconnectAll()">🔁 Hammasini navbat bilan ulash</button>
+          <button class="secondary" onclick="loadBots()">Yangilash</button>
+        </div>
       </div>
       <div id="botsList">Yuklanmoqda...</div>
+
+      <div style="margin-top:14px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-size:12px;color:#94a3b8;">INITIAL_ACCOUNTS (Render env uchun):</span>
+          <button class="secondary" style="padding:5px 10px;font-size:12px;" onclick="copyEnv()">Nusxalash</button>
+        </div>
+        <input type="text" id="envPreview" class="env-box" readonly>
+      </div>
     </div>
   </div>
 </div>
@@ -374,6 +422,7 @@ async function loadBots() {
   const prevVal = selEl.value;
 
   document.getElementById('botCount').textContent = data.bots.length;
+  document.getElementById('envPreview').value = data.envString || '';
   selEl.innerHTML = '<option value="ALL">📢 Barcha akkauntlarga</option>';
 
   if (data.bots.length === 0) {
@@ -429,6 +478,12 @@ async function reconnectAcc(username) {
   loadBots();
 }
 
+async function reconnectAll() {
+  const res = await api('/api/reconnect-all');
+  toast(res.message);
+  loadBots();
+}
+
 async function sendCmd() {
   const target = document.getElementById('targetSelect').value;
   const command = document.getElementById('cmdInput').value;
@@ -436,6 +491,13 @@ async function sendCmd() {
   const res = await api('/api/cmd', { target, command });
   toast(res.message);
   document.getElementById('cmdInput').value = '';
+}
+
+function copyEnv() {
+  const el = document.getElementById('envPreview');
+  el.select();
+  navigator.clipboard?.writeText(el.value);
+  toast('INITIAL_ACCOUNTS nusxalandi');
 }
 
 if (adminPass) login();
@@ -452,19 +514,16 @@ const host = '0.0.0.0';
 http.createServer(async (req, res) => {
   const parsed = url.parse(req.url, true);
 
-  // Koyeb health check va UptimeRobot uchun ochiq manzil
   if (parsed.pathname === '/ping' || parsed.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     return res.end(`OK (${bots.size} bots)\n`);
   }
 
-  // Asosiy web sahifa
   if (req.method === 'GET' && parsed.pathname === '/') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     return res.end(HTML_PAGE);
   }
 
-  // API endpointlar (Parol tekshiruvi bilan)
   if (req.method === 'POST' && parsed.pathname.startsWith('/api/')) {
     if (req.headers['x-admin-pass'] !== ADMIN_PASS) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -480,7 +539,7 @@ http.createServer(async (req, res) => {
         status: b.status,
         online: Boolean(b.bot && b.bot.entity)
       }));
-      return res.end(JSON.stringify({ ok: true, bots: list }));
+      return res.end(JSON.stringify({ ok: true, bots: list, envString: buildEnvString() }));
     }
 
     if (parsed.pathname === '/api/add') {
@@ -501,9 +560,15 @@ http.createServer(async (req, res) => {
         if (state.bot) {
           try { state.bot.quit(); } catch (_) {}
         }
-        scheduleReconnect(state, 'Qo‘lda qayta ulash');
+        state.isReconnecting = false;
+        connectBot(state);
       }
       return res.end(JSON.stringify({ ok: true, message: `${body.username} qayta ulanmoqda` }));
+    }
+
+    if (parsed.pathname === '/api/reconnect-all') {
+      reconnectAllSequential();
+      return res.end(JSON.stringify({ ok: true, message: `Barcha ${bots.size} ta akkaunt navbat bilan ulanmoqda` }));
     }
 
     if (parsed.pathname === '/api/cmd') {
